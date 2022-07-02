@@ -1,0 +1,29 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+#
+# Environment to build a Linux image with getsockopt(TLS_RX) support
+#
+
+$provision_base1 = <<-EOS
+echo "Installing dependencies (phase 1)"
+export NWORKERS=`nproc`
+export BUILD_ROOT=/home/vagrant
+bash /home/vagrant/Prism-HTTP/scripts/install_base.sh
+EOS
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "generic/ubuntu1804"
+
+  # Copy source directory to VM. Shared filesystem doesn't work for custom kernel.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.vm.provision "file", source: "../", destination: "/home/vagrant/Prism-HTTP"
+
+  config.vm.provider "libvirt" do |v|
+    v.cpus = 4
+    v.memory = "4096"
+  end
+
+
+  config.vm.provision "shell", inline: $provision_base1
+end

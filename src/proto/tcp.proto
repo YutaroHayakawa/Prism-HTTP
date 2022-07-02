@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package prism;
+
+message TCPState {
+  uint32 seq = 1;
+  uint32 ack = 2;
+  bytes sendq = 3;
+  uint64 sendq_len = 4;
+  uint64 unsentq_len = 5;
+  bytes recvq = 6;
+  uint64 recvq_len = 7;
+  uint32 self_addr = 8;
+  uint32 self_port = 9;
+  uint32 peer_addr = 10;
+  uint32 peer_port = 11;
+  uint32 mss = 12;
+  uint32 send_wscale = 13;
+  uint32 recv_wscale = 14;
+  uint32 timestamp = 15;
+  uint32 snd_wl1 = 16;
+  uint32 snd_wnd = 17;
+  uint32 max_window = 18;
+  uint32 rcv_wnd = 19;
+  uint32 rcv_wup = 20;
+}

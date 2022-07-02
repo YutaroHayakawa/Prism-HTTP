@@ -1,0 +1,204 @@
+diff -uprN linux-4.18-orig/linux-4.18/include/linux/tcp.h linux-4.18/include/linux/tcp.h
+--- linux-4.18-orig/linux-4.18/include/linux/tcp.h	2018-08-12 20:41:04.000000000 +0000
++++ linux-4.18/include/linux/tcp.h	2019-02-28 16:40:37.332767672 +0000
+@@ -387,6 +387,8 @@ struct tcp_sock {
+ 	 */
+ 	struct request_sock *fastopen_rsk;
+ 	u32	*saved_syn;
++
++	struct eventfd_ctx *tcp_monitor_ctx;
+ };
+
+ enum tsq_enum {
+diff -uprN linux-4.18-orig/linux-4.18/include/uapi/linux/tcp.h linux-4.18/include/uapi/linux/tcp.h
+--- linux-4.18-orig/linux-4.18/include/uapi/linux/tcp.h	2018-08-12 20:41:04.000000000 +0000
++++ linux-4.18/include/uapi/linux/tcp.h	2019-02-28 16:51:10.252267739 +0000
+@@ -124,6 +124,7 @@ enum {
+ #define TCP_FASTOPEN_NO_COOKIE	34	/* Enable TFO without a TFO cookie */
+ #define TCP_ZEROCOPY_RECEIVE	35
+ #define TCP_INQ			36	/* Notify bytes available to read as a cmsg on read */
++#define TCP_MONITOR_SET_EVENTFD 100 /* Set eventfd for monitoring physical delete of kernel tcp_sock */
+
+ #define TCP_CM_INQ		TCP_INQ
+
+diff -uprN linux-4.18-orig/linux-4.18/net/ipv4/tcp.c linux-4.18/net/ipv4/tcp.c
+--- linux-4.18-orig/linux-4.18/net/ipv4/tcp.c	2018-08-12 20:41:04.000000000 +0000
++++ linux-4.18/net/ipv4/tcp.c	2019-02-28 16:39:04.142040413 +0000
+@@ -252,6 +252,7 @@
+ #include <linux/module.h>
+ #include <linux/types.h>
+ #include <linux/fcntl.h>
++#include <linux/file.h>
+ #include <linux/poll.h>
+ #include <linux/inet_diag.h>
+ #include <linux/init.h>
+@@ -270,6 +271,7 @@
+ #include <linux/time.h>
+ #include <linux/slab.h>
+ #include <linux/errqueue.h>
++#include <linux/eventfd.h>
+ #include <linux/static_key.h>
+
+ #include <net/icmp.h>
+@@ -454,6 +456,8 @@ void tcp_init_sock(struct sock *sk)
+
+ 	sk_sockets_allocated_inc(sk);
+ 	sk->sk_route_forced_caps = NETIF_F_GSO;
++
++	tp->tcp_monitor_ctx = NULL;
+ }
+ EXPORT_SYMBOL(tcp_init_sock);
+
+@@ -2705,6 +2709,31 @@ static int tcp_repair_options_est(struct
+ 	return 0;
+ }
+
++static int
++tcp_monitor_set_eventfd(struct tcp_sock *tp, char __user *optval,
++    unsigned int optlen)
++{
++  int eventfd;
++  struct eventfd_ctx *ctx;
++
++  if (copy_from_user(&eventfd, optval, sizeof(int)) != 0) {
++    return -EFAULT;
++  }
++
++  ctx = eventfd_ctx_fdget(eventfd);
++  if (IS_ERR(ctx)) {
++    return PTR_ERR(ctx);
++  }
++
++  if (tp->tcp_monitor_ctx != NULL) {
++    eventfd_ctx_put(tp->tcp_monitor_ctx);
++  }
++
++  tp->tcp_monitor_ctx = ctx;
++
++  return 0;
++}
++
+ /*
+  *	Socket option code for TCP.
+  */
+@@ -3047,6 +3076,9 @@ static int do_tcp_setsockopt(struct sock
+ 		else
+ 			tp->recvmsg_inq = val;
+ 		break;
++  case TCP_MONITOR_SET_EVENTFD:
++    err = tcp_monitor_set_eventfd(tp, optval, optlen);
++    break;
+ 	default:
+ 		err = -ENOPROTOOPT;
+ 		break;
+diff -uprN linux-4.18-orig/linux-4.18/net/ipv4/tcp_ipv4.c linux-4.18/net/ipv4/tcp_ipv4.c
+--- linux-4.18-orig/linux-4.18/net/ipv4/tcp_ipv4.c	2018-08-12 20:41:04.000000000 +0000
++++ linux-4.18/net/ipv4/tcp_ipv4.c	2019-02-28 16:39:47.689440790 +0000
+@@ -55,6 +55,7 @@
+ #include <linux/bottom_half.h>
+ #include <linux/types.h>
+ #include <linux/fcntl.h>
++#include <linux/file.h>
+ #include <linux/module.h>
+ #include <linux/random.h>
+ #include <linux/cache.h>
+@@ -2005,6 +2006,11 @@ void tcp_v4_destroy_sock(struct sock *sk
+ 	tcp_fastopen_destroy_cipher(sk);
+ 	tcp_saved_syn_free(tp);
+
++	if (tp->tcp_monitor_ctx != NULL) {
++    eventfd_signal(tp->tcp_monitor_ctx, 1);
++    eventfd_ctx_put(tp->tcp_monitor_ctx);
++  }
++
+ 	sk_sockets_allocated_dec(sk);
+ }
+ EXPORT_SYMBOL(tcp_v4_destroy_sock);
+diff -uprN linux-4.18-orig/linux-4.18/net/tls/tls_main.c linux-4.18/net/tls/tls_main.c
+--- linux-4.18-orig/linux-4.18/net/tls/tls_main.c	2018-08-12 20:41:04.000000000 +0000
++++ linux-4.18/net/tls/tls_main.c	2019-03-05 13:38:54.663779821 +0000
+@@ -376,6 +376,74 @@ out:
+ 	return rc;
+ }
+
++static int do_tls_getsockopt_rx(struct sock *sk, char __user *optval,
++				int __user *optlen)
++{
++	int rc = 0;
++	struct tls_context *ctx = tls_get_ctx(sk);
++	struct tls_crypto_info *crypto_info;
++	int len;
++
++	if (get_user(len, optlen))
++		return -EFAULT;
++
++	if (!optval || (len < sizeof(*crypto_info))) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	if (!ctx) {
++		rc = -EBUSY;
++		goto out;
++	}
++
++	/* get user crypto info */
++	crypto_info = &ctx->crypto_recv;
++
++	if (!TLS_CRYPTO_INFO_READY(crypto_info)) {
++		rc = -EBUSY;
++		goto out;
++	}
++
++	if (len == sizeof(*crypto_info)) {
++		if (copy_to_user(optval, crypto_info, sizeof(*crypto_info)))
++			rc = -EFAULT;
++		goto out;
++	}
++
++	switch (crypto_info->cipher_type) {
++	case TLS_CIPHER_AES_GCM_128: {
++		struct tls12_crypto_info_aes_gcm_128 *
++		  crypto_info_aes_gcm_128 =
++		  container_of(crypto_info,
++			       struct tls12_crypto_info_aes_gcm_128,
++			       info);
++
++		if (len != sizeof(*crypto_info_aes_gcm_128)) {
++			rc = -EINVAL;
++			goto out;
++		}
++		lock_sock(sk);
++		memcpy(crypto_info_aes_gcm_128->iv,
++		       ctx->rx.iv + TLS_CIPHER_AES_GCM_128_SALT_SIZE,
++		       TLS_CIPHER_AES_GCM_128_IV_SIZE);
++		memcpy(crypto_info_aes_gcm_128->rec_seq, ctx->rx.rec_seq,
++		       TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
++		release_sock(sk);
++		if (copy_to_user(optval,
++				 crypto_info_aes_gcm_128,
++				 sizeof(*crypto_info_aes_gcm_128)))
++			rc = -EFAULT;
++		break;
++	}
++	default:
++		rc = -EINVAL;
++	}
++
++out:
++	return rc;
++}
++
+ static int do_tls_getsockopt(struct sock *sk, int optname,
+ 			     char __user *optval, int __user *optlen)
+ {
+@@ -385,6 +453,9 @@ static int do_tls_getsockopt(struct sock
+ 	case TLS_TX:
+ 		rc = do_tls_getsockopt_tx(sk, optval, optlen);
+ 		break;
++	case TLS_RX:
++		rc = do_tls_getsockopt_rx(sk, optval, optlen);
++		break;
+ 	default:
+ 		rc = -ENOPROTOOPT;
+ 		break;

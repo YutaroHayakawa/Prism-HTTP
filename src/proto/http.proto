@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+import "tcp.proto";
+import "tls.proto";
+
+package prism;
+
+message HTTPHeader {
+  uint64 name_ofs = 1;
+  uint64 name_len = 2;
+  uint64 val_ofs = 3;
+  uint64 val_len = 4;
+}
+
+message HTTPReq {
+  bytes buf = 1;
+  uint32 minor_version = 2;
+  uint64 method_ofs = 3;
+  uint64 method_len = 4;
+  uint64 path_ofs = 5;
+  uint64 path_len = 6;
+  uint64 body_ofs = 7;
+  uint64 body_len = 8;
+  uint64 nheaders = 9;
+  repeated HTTPHeader headers = 10;
+}
+
+message HTTPHandoffReq {
+  TCPState tcp = 1;
+  TLSState tls = 2;
+  HTTPReq http = 3;
+}
+
+message HTTPHandoffReply {
+  int32 error = 1;
+};
